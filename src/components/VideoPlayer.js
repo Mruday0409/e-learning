@@ -116,6 +116,7 @@ const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
     setShowQualityMenu(false);
 
     let hls;
+    let script = null;
 
     const initPlayer = () => {
       console.log('🎥 Initializing video player with source:', videoSrc);
@@ -142,7 +143,10 @@ const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
 
         if (window.Hls && window.Hls.isSupported()) {
           console.log('✅ HLS.js is supported, creating new HLS instance');
-          hls = new window.Hls();
+          hls = new window.Hls({
+            enableWorker: true,
+            lowLatencyMode: false,
+          });
 
           hls.loadSource(videoSrc);
 
@@ -158,6 +162,9 @@ const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
             const parsedLevels = data.levels || [];
             setLevels(parsedLevels);
             setIsBuffering(false);
+            if (videoRef.current) {
+              setDuration(videoRef.current.duration);
+            }
           });
 
           hls.on(window.Hls.Events.ERROR, (event, data) => {
@@ -177,27 +184,24 @@ const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
         } else {
           console.error('❌ HLS not supported and native HLS not available');
         }
-
       }
-
     };
 
     if (!window.Hls) {
-
-      const script = document.createElement('script');
-
+      script = document.createElement('script');
       script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
-
       script.async = true;
-
       script.onload = initPlayer;
-
+      script.onerror = () => {
+        console.error('Failed to load HLS.js');
+        if (videoRef.current) {
+          videoRef.current.src = videoSrc;
+          videoRef.current.load();
+        }
+      };
       document.body.appendChild(script);
-
     } else {
-
       initPlayer();
-
     }
 
     return () => { 
@@ -216,6 +220,7 @@ const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
           console.warn('Error destroying HLS in cleanup:', e);
         }
       }
+      
       // Also cleanup from ref
       if (hlsInstanceRef.current) {
         try {
@@ -226,6 +231,26 @@ const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
         }
         hlsInstanceRef.current = null;
       }
+      
+      // Cleanup video element
+      if (videoRef.current) {
+        try {
+          videoRef.current.pause();
+          videoRef.current.removeAttribute('src');
+          videoRef.current.src = '';
+          videoRef.current.srcObject = null;
+          videoRef.current.load();
+          videoRef.current.currentTime = 0;
+        } catch (e) {
+          console.warn('Error cleaning up video element:', e);
+        }
+      }
+      
+      // Remove script if it was added
+      if (script && document.body.contains(script)) {
+        document.body.removeChild(script);
+      }
+      
       // Stop video completely if it hasn't started playing
       if (videoRef.current && !hasStartedPlayingRef.current) {
         try {
