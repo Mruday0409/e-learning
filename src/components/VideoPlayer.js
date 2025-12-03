@@ -1,436 +1,850 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
-  X, Play, Pause, RotateCcw, RotateCw, Maximize, Settings, Volume2, VolumeX 
+  X, Play, Pause, RotateCcw, RotateCw, Maximize, Settings, Volume2, VolumeX, Loader2, ChevronLeft, ArrowLeft
 } from 'lucide-react';
 import './VideoPlayer.css';
 
-const VideoPlayer = ({ src, onClose, title }) => {
+const VideoPlayer = ({ src, onClose, title, chapters = [], onBack }) => {
+  console.log('🎬 VideoPlayer component rendering');
+  console.log('🎬 Props received:', { src, title, hasOnClose: !!onClose, hasOnBack: !!onBack, chaptersCount: chapters.length });
+
+  const videoSrc = src || "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8";
+
+  
+
   const videoRef = useRef(null);
+
   const playerRef = useRef(null);
+
   const hlsInstanceRef = useRef(null);
+
+  
+
   const [isPlaying, setIsPlaying] = useState(false);
+
   const [progress, setProgress] = useState(0);
+
   const [duration, setDuration] = useState(0);
+
   const [currentTime, setCurrentTime] = useState(0);
+
   const [isMuted, setIsMuted] = useState(false);
+
+  const [volume, setVolume] = useState(1);
+
   const [showControls, setShowControls] = useState(true);
+
   const [showQualityMenu, setShowQualityMenu] = useState(false);
+
   const [quality, setQuality] = useState('Auto');
-  const [hlsInstance, setHlsInstance] = useState(null);
+
   const [levels, setLevels] = useState([]);
 
-  // Global error handler to suppress play() interruption errors
-  useEffect(() => {
-    const handleUnhandledRejection = (event) => {
-      if (event.reason && (
-        (event.reason.message && event.reason.message.includes('play() request was interrupted')) ||
-        event.reason.name === 'AbortError' ||
-        event.reason.name === 'NotAllowedError'
-      )) {
-        // Suppress this specific error - it's harmless
-        event.preventDefault();
-        return;
-      }
-    };
-    
-    window.addEventListener('unhandledrejection', handleUnhandledRejection);
-    
-    return () => {
-      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
-    };
-  }, []);
+  const [isBuffering, setIsBuffering] = useState(true);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      // Cleanup HLS instance
-      if (hlsInstanceRef.current) {
-        try {
-          hlsInstanceRef.current.destroy();
-        } catch (e) {
-          console.warn('Error destroying HLS on unmount:', e);
+  const [hasActuallyStartedPlaying, setHasActuallyStartedPlaying] = useState(false);
+
+  const hasStartedPlayingRef = useRef(false);
+
+  const isMountedRef = useRef(true);
+
+  const controlTimeout = useRef(null);
+
+  // Process quality levels: remove duplicates, sort
+  const getProcessedLevels = () => {
+    if (!levels || levels.length === 0) return [];
+    
+    // Create a map to remove duplicates by height
+    const uniqueLevels = new Map();
+    levels.forEach((level, index) => {
+      const height = level.height || 0;
+      // Show all valid heights (greater than 0)
+      if (height > 0) {
+        // If we already have this height, keep the one with higher bitrate
+        if (!uniqueLevels.has(height)) {
+          uniqueLevels.set(height, { ...level, originalIndex: index });
+        } else {
+          const existing = uniqueLevels.get(height);
+          const existingBitrate = existing.bitrate || 0;
+          const currentBitrate = level.bitrate || 0;
+          if (currentBitrate > existingBitrate) {
+            uniqueLevels.set(height, { ...level, originalIndex: index });
+          }
         }
-        hlsInstanceRef.current = null;
       }
-      // Cleanup video
+    });
+    
+    // Convert to array and sort by height (highest first)
+    const result = Array.from(uniqueLevels.values())
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    
+    return result;
+  };
+
+  // Format quality label
+  const formatQualityLabel = (height) => {
+    if (height >= 2160) return '4K';
+    if (height >= 1440) return '1440p';
+    if (height >= 1080) return '1080p HD';
+    if (height >= 720) return '720p HD';
+    if (height >= 480) return '480p SD';
+    return `${height}p`;
+  };
+
+  // --- INITIALIZATION ---
+
+  useEffect(() => {
+    console.log('🔄 VideoPlayer useEffect running - videoSrc:', videoSrc);
+    
+    // Mark component as mounted
+    isMountedRef.current = true;
+    
+    // Prevent body scroll when video player is open
+    document.body.style.overflow = 'hidden';
+
+    // Reset ALL state when component mounts or source changes
+    setHasActuallyStartedPlaying(false);
+    hasStartedPlayingRef.current = false;
+    setIsPlaying(false);
+    setIsBuffering(true);
+    setProgress(0);
+    setCurrentTime(0);
+    setDuration(0);
+    setLevels([]);
+    setQuality('Auto');
+    setShowControls(true);
+    setShowQualityMenu(false);
+
+    let hls;
+
+    const initPlayer = () => {
+      console.log('🎥 Initializing video player with source:', videoSrc);
+
       if (videoRef.current) {
-        videoRef.current.pause();
-        videoRef.current.removeAttribute('src');
-        videoRef.current.load();
-      }
-    };
-  }, []);
-
-  // HLS Integration
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video || !src) return;
-
-    let hls = null;
-    let script = null;
-    
-    // Check if HLS.js is already loaded
-    if (window.Hls && window.Hls.isSupported()) {
-      hls = new window.Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-      });
-      
-      hls.loadSource(src);
-      hls.attachMedia(video);
-      
-      hls.on(window.Hls.Events.MANIFEST_PARSED, (event, data) => {
-        setLevels(data.levels || []);
-        if (videoRef.current) {
-          setDuration(videoRef.current.duration);
+        // Clean up any existing HLS instance first
+        if (hlsInstanceRef.current) {
+          console.log('🧹 Cleaning up existing HLS instance');
+          try {
+            hlsInstanceRef.current.destroy();
+            hlsInstanceRef.current.detachMedia();
+          } catch (e) {
+            console.warn('Error cleaning up existing HLS:', e);
+          }
+          hlsInstanceRef.current = null;
         }
-      });
-      
-      hls.on(window.Hls.Events.ERROR, (event, data) => {
-        if (data.fatal) {
-          console.error('HLS error:', data);
-        }
-      });
-      
-      setHlsInstance(hls);
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS support (Safari)
-      video.src = src;
-      video.load();
-    } else {
-      // Load HLS.js script
-      script = document.createElement('script');
-      script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
-      script.async = true;
-      
-      script.onload = () => {
-        if (window.Hls && window.Hls.isSupported() && videoRef.current) {
-          const newHls = new window.Hls({
-            enableWorker: true,
-            lowLatencyMode: false,
-          });
-          
-          newHls.loadSource(src);
-          newHls.attachMedia(videoRef.current);
-          
-          newHls.on(window.Hls.Events.MANIFEST_PARSED, (event, data) => {
-            setLevels(data.levels || []);
-            if (videoRef.current) {
-              setDuration(videoRef.current.duration);
+
+        // Reset video element
+        const video = videoRef.current;
+        video.pause();
+        video.currentTime = 0;
+        video.src = '';
+        video.load();
+
+        if (window.Hls && window.Hls.isSupported()) {
+          console.log('✅ HLS.js is supported, creating new HLS instance');
+          hls = new window.Hls();
+
+          hls.loadSource(videoSrc);
+
+          hls.attachMedia(videoRef.current);
+
+          hls.on(window.Hls.Events.MANIFEST_PARSED, (event, data) => {
+            // Only update if component is still mounted
+            if (!isMountedRef.current) {
+              console.log('⚠️ Component unmounted, ignoring manifest parsed');
+              return;
             }
+            console.log('✅ HLS manifest parsed, levels:', data.levels?.length || 0);
+            const parsedLevels = data.levels || [];
+            setLevels(parsedLevels);
+            setIsBuffering(false);
           });
-          
-          newHls.on(window.Hls.Events.ERROR, (event, data) => {
+
+          hls.on(window.Hls.Events.ERROR, (event, data) => {
+            console.error('❌ HLS Error:', data);
             if (data.fatal) {
-              console.error('HLS error:', data);
+              console.error('❌ Fatal HLS error, attempting recovery');
             }
           });
-          
-          setHlsInstance(newHls);
-          hlsInstanceRef.current = newHls;
-        } else if (videoRef.current && videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
-          videoRef.current.src = src;
+
+          hlsInstanceRef.current = hls;
+
+        } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+          console.log('✅ Native HLS support detected (Safari)');
+          videoRef.current.src = videoSrc;
           videoRef.current.load();
+          setIsBuffering(false);
+        } else {
+          console.error('❌ HLS not supported and native HLS not available');
         }
-      };
-      
-      script.onerror = () => {
-        console.error('Failed to load HLS.js');
-        if (videoRef.current) {
-          videoRef.current.src = src;
-          videoRef.current.load();
-        }
-      };
-      
-      document.body.appendChild(script);
-    }
-    
-    // Store hls instance in ref
-    if (hls) {
-      hlsInstanceRef.current = hls;
-    }
-    
-    return () => {
-      // Cleanup HLS instance from ref (most reliable)
-      if (hlsInstanceRef.current) {
-        try {
-          hlsInstanceRef.current.destroy();
-        } catch (e) {
-          console.warn('Error destroying HLS instance from ref:', e);
-        }
-        hlsInstanceRef.current = null;
+
       }
-      // Also cleanup local hls if it exists
+
+    };
+
+    if (!window.Hls) {
+
+      const script = document.createElement('script');
+
+      script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
+
+      script.async = true;
+
+      script.onload = initPlayer;
+
+      document.body.appendChild(script);
+
+    } else {
+
+      initPlayer();
+
+    }
+
+    return () => { 
+      // Mark component as unmounted
+      isMountedRef.current = false;
+      
+      // Restore body scroll
+      document.body.style.overflow = '';
+      
+      // Cleanup HLS instance
       if (hls) {
         try {
           hls.destroy();
+          hls.detachMedia();
         } catch (e) {
-          console.warn('Error destroying local HLS instance:', e);
+          console.warn('Error destroying HLS in cleanup:', e);
         }
       }
-      // Cleanup video element
-      const videoElement = videoRef.current;
-      if (videoElement) {
-        videoElement.pause();
-        videoElement.removeAttribute('src');
-        videoElement.load();
-        // Reset video properties
-        videoElement.currentTime = 0;
-      }
-      // Remove script if it was added
-      if (script && document.body.contains(script)) {
+      // Also cleanup from ref
+      if (hlsInstanceRef.current) {
         try {
-          document.body.removeChild(script);
+          hlsInstanceRef.current.destroy();
+          hlsInstanceRef.current.detachMedia();
         } catch (e) {
-          console.warn('Error removing script:', e);
+          console.warn('Error destroying HLS ref in cleanup:', e);
+        }
+        hlsInstanceRef.current = null;
+      }
+      // Stop video completely if it hasn't started playing
+      if (videoRef.current && !hasStartedPlayingRef.current) {
+        try {
+          videoRef.current.pause();
+          videoRef.current.src = '';
+          videoRef.current.srcObject = null;
+          videoRef.current.load();
+          videoRef.current.currentTime = 0;
+        } catch (e) {
+          console.warn('Error stopping video in cleanup:', e);
         }
       }
-      // Reset state
-      setHlsInstance(null);
-      setLevels([]);
-      setProgress(0);
-      setDuration(0);
-      setCurrentTime(0);
-      setIsPlaying(false);
-      setQuality('Auto');
     };
-  }, [src]);
 
-  // Time Update Handler
-  const handleTimeUpdate = () => {
-    if (videoRef.current) {
-      const current = videoRef.current.currentTime;
-      const dur = videoRef.current.duration;
-      setCurrentTime(current);
-      setDuration(dur);
-      setProgress((current / dur) * 100);
+  }, [videoSrc]);
+
+  // --- TIMEOUT LOGIC ---
+
+  const resetControlTimeout = () => {
+
+    if (controlTimeout.current) clearTimeout(controlTimeout.current);
+
+    if (isPlaying) {
+
+      controlTimeout.current = setTimeout(() => {
+
+        setShowControls(false);
+
+        setShowQualityMenu(false);
+
+      }, 3000);
+
     }
+
   };
 
-  // Controls Logic - Fixed to prevent play() interruption error
+  // --- INTERACTION HANDLERS ---
+
+  const handleScreenClick = (e) => {
+
+    // If clicking a button or input, let that event handle itself
+
+    if (e.target.closest('button') || e.target.closest('input')) return;
+
+    
+
+    // Toggle Logic
+
+    setShowControls(prev => {
+
+      const newState = !prev;
+
+      if (newState) {
+
+        // Showing controls -> start hide timer
+
+        resetControlTimeout();
+
+      } else {
+
+        // Hiding controls -> clear timer
+
+        if (controlTimeout.current) clearTimeout(controlTimeout.current);
+
+        setShowQualityMenu(false);
+
+      }
+
+      return newState;
+
+    });
+
+  };
+
+  const handleInteraction = () => {
+
+    if (!showControls) setShowControls(true);
+
+    resetControlTimeout();
+
+  };
+
+  // --- MEDIA ACTIONS ---
+
   const togglePlay = () => {
-    const video = videoRef.current;
-    if (!video) return;
 
-    if (video.paused) {
-      // Use play() promise but handle errors gracefully
-      const playPromise = video.play();
-      if (playPromise !== undefined) {
-        playPromise
-          .then(() => {
-            // Playback started successfully
-            setIsPlaying(true);
-          })
-          .catch(error => {
-            // Handle play() interruption or other errors
-            if (error.name !== 'AbortError' && error.name !== 'NotAllowedError') {
-              console.log('Play error:', error);
-            }
-            setIsPlaying(false);
-          });
-      } else {
-        setIsPlaying(true);
-      }
+    if (videoRef.current.paused) {
+
+      videoRef.current.play().then(() => setIsPlaying(true)).catch(console.log);
+
+      resetControlTimeout();
+
     } else {
-      video.pause();
+
+      videoRef.current.pause();
+
       setIsPlaying(false);
+
+      // Keep controls visible when paused
+
+      setShowControls(true); 
+
+      if (controlTimeout.current) clearTimeout(controlTimeout.current);
+
     }
+
   };
 
-  const skip = (seconds) => {
-    if (videoRef.current) {
-      videoRef.current.currentTime += seconds;
+  const handleTimeUpdate = () => {
+
+    setCurrentTime(videoRef.current.currentTime);
+
+    setDuration(videoRef.current.duration);
+
+    if (videoRef.current.duration) {
+
+      setProgress((videoRef.current.currentTime / videoRef.current.duration) * 100);
+
     }
+
   };
 
-  const toggleMute = () => {
-    if (videoRef.current) {
-      videoRef.current.muted = !videoRef.current.muted;
-      setIsMuted(!isMuted);
-    }
+  const handleSeek = (e) => {
+
+    const rect = e.currentTarget.getBoundingClientRect();
+
+    const x = e.clientX - rect.left;
+
+    const pos = x / rect.width;
+
+    videoRef.current.currentTime = pos * duration;
+
+    handleInteraction();
+
   };
 
-  const toggleFullscreen = async () => {
-    try {
-      if (!document.fullscreenElement) {
-        if (playerRef.current.requestFullscreen) {
-          await playerRef.current.requestFullscreen();
-        } else if (playerRef.current.webkitRequestFullscreen) {
-          await playerRef.current.webkitRequestFullscreen();
-        } else if (playerRef.current.msRequestFullscreen) {
-          await playerRef.current.msRequestFullscreen();
-        }
+  const skip = (val) => {
+
+    videoRef.current.currentTime += val;
+
+    handleInteraction();
+
+  };
+
+  const changeQuality = (originalIndex) => {
+
+    if (hlsInstanceRef.current) {
+
+      if (originalIndex === -1) {
+
+        hlsInstanceRef.current.currentLevel = -1;
+
+        setQuality('Auto');
+
       } else {
-        if (document.exitFullscreen) {
-          await document.exitFullscreen();
-        } else if (document.webkitExitFullscreen) {
-          await document.webkitExitFullscreen();
-        } else if (document.msExitFullscreen) {
-          await document.msExitFullscreen();
-        }
+
+        hlsInstanceRef.current.currentLevel = originalIndex;
+
+        const level = levels[originalIndex];
+
+        setQuality(formatQualityLabel(level.height));
+
       }
-    } catch (err) {
-      console.warn("Fullscreen request failed:", err);
+
+      setShowQualityMenu(false);
+
     }
+
   };
 
-  const handleQualityChange = (index) => {
-    const hls = hlsInstanceRef.current || hlsInstance;
-    if (hls) {
-      hls.currentLevel = index;
-      setQuality(index === -1 ? 'Auto' : `${levels[index].height}p`);
-      setShowQualityMenu(false);
+  const toggleFullscreen = () => {
+
+    if (!document.fullscreenElement) {
+
+      playerRef.current.requestFullscreen().catch(console.log);
+
+    } else {
+
+      document.exitFullscreen();
+
     }
+
   };
 
   const formatTime = (time) => {
+
     if (!isFinite(time)) return '0:00';
-    const minutes = Math.floor(time / 60);
-    const seconds = Math.floor(time % 60);
-    return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+
+    const m = Math.floor(time / 60);
+
+    const s = Math.floor(time % 60);
+
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+
   };
 
+  // Handle close - stop video completely if it hasn't actually started playing
+  const handleClose = () => {
+    console.log('🔴 handleClose called in VideoPlayer');
+    // Mark as unmounted immediately to prevent any callbacks
+    isMountedRef.current = false;
+    
+    // ALWAYS destroy HLS instance first to stop loading/streaming
+    if (hlsInstanceRef.current) {
+      try {
+        // Stop all HLS operations
+        hlsInstanceRef.current.stopLoad();
+        hlsInstanceRef.current.destroy();
+        hlsInstanceRef.current.detachMedia();
+      } catch (e) {
+        console.warn('Error destroying HLS:', e);
+      }
+      hlsInstanceRef.current = null;
+    }
+    
+    // Stop video element completely
+    if (videoRef.current) {
+      try {
+        // Pause immediately
+        videoRef.current.pause();
+        // Remove all sources
+        const video = videoRef.current;
+        video.src = '';
+        video.srcObject = null;
+        video.removeAttribute('src');
+        // Stop loading
+        video.load();
+        // Reset all properties
+        video.currentTime = 0;
+        video.muted = true;
+        video.volume = 0;
+      } catch (e) {
+        console.warn('Error stopping video:', e);
+      }
+    }
+    
+    // Reset state
+    setHasActuallyStartedPlaying(false);
+    hasStartedPlayingRef.current = false;
+    setIsPlaying(false);
+    setIsBuffering(false);
+    
+    // Call the onClose callback to unmount the component
+    if (onClose) {
+      onClose();
+    }
+  };
+
+  // Generate chapters list if not provided
+  const defaultChapters = chapters.length > 0 ? chapters : [
+    { id: 1, title: 'Introduction', time: '0:00' },
+    { id: 2, title: 'Chapter 1: Basics', time: '5:30' },
+    { id: 3, title: 'Chapter 2: Advanced', time: '12:45' },
+    { id: 4, title: 'Chapter 3: Practice', time: '20:10' },
+    { id: 5, title: 'Summary', time: '28:00' },
+  ];
+
+  // Debug: Log when component renders
+  useEffect(() => {
+    console.log('✅ VideoPlayer component MOUNTED');
+    console.log('✅ VideoPlayer state:', {
+      isPlaying,
+      isBuffering,
+      showControls,
+      hasActuallyStartedPlaying: hasStartedPlayingRef.current
+    });
+    return () => {
+      console.log('❌ VideoPlayer component UNMOUNTING');
+    };
+  }, []);
+  
+  // Debug: Log when key states change
+  useEffect(() => {
+    console.log('🔄 VideoPlayer state updated:', {
+      isPlaying,
+      isBuffering,
+      showControls,
+      quality,
+      levelsCount: levels.length
+    });
+  }, [isPlaying, isBuffering, showControls, quality, levels.length]);
+
   return (
-    <div className="video-player-overlay" onClick={onClose}>
+
+    <div className="video-player-overlay">
+
       <div 
-        ref={playerRef}
-        className="video-player-container"
-        onMouseEnter={() => setShowControls(true)}
-        onMouseLeave={() => setShowControls(false)}
+        className="video-player-wrapper"
         onClick={(e) => e.stopPropagation()}
       >
-        <video 
-          ref={videoRef}
-          className="video-element"
-          onTimeUpdate={handleTimeUpdate}
-          onClick={togglePlay}
-          onEnded={() => setIsPlaying(false)}
-          onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
-        />
 
-        {/* Controls Overlay */}
-        <div className={`video-controls-overlay ${showControls || !isPlaying ? '' : 'hidden'}`}>
+        {/* Back Button */}
+        {(onBack || onClose) && (
+          <button 
+            onClick={(e) => {
+              e.stopPropagation();
+              console.log('🔙 Back button clicked');
+              if (onBack) {
+                console.log('🔙 Calling onBack prop');
+                onBack();
+              } else {
+                console.log('🔙 Calling handleClose (no onBack prop)');
+                handleClose();
+              }
+            }} 
+            className="video-back-btn"
+          >
+            <ArrowLeft size={20} />
+            <span>Back</span>
+          </button>
+        )}
+
+        <div className="video-player-layout">
           
-          {/* Top Bar */}
-          <div className="video-top-bar">
-            <h3 className="video-title">{title || 'Video Lesson'}</h3>
-            <button onClick={onClose} className="video-close-btn">
-              <X size={20} />
-            </button>
-          </div>
+          {/* Left Side - Video Player */}
+          <div className="video-player-main">
+            <div 
 
-          {/* Center Play Button (only when paused) */}
-          {!isPlaying && (
+              ref={playerRef}
+
+              className="video-player-container"
+
+              onClick={(e) => {
+                e.stopPropagation();
+                handleScreenClick(e);
+              }}
+
+              onMouseMove={handleInteraction}
+
+            >
+
+              <video 
+
+                ref={videoRef}
+
+                className="video-element"
+
+                onTimeUpdate={handleTimeUpdate}
+
+                onEnded={() => setIsPlaying(false)}
+
+                onWaiting={() => setIsBuffering(true)}
+
+                onPlaying={() => {
+                  // Only update if component is still mounted
+                  if (!isMountedRef.current) return;
+                  setIsBuffering(false);
+                  setHasActuallyStartedPlaying(true);
+                  hasStartedPlayingRef.current = true;
+                }}
+
+              />
+
+              {isBuffering && (
+
+                <div className="video-loader">
+
+                  <Loader2 size={40} color="#fff" className="spin" />
+
+                </div>
+
+              )}
+
+              <div className={`video-controls-overlay ${showControls ? '' : 'hidden'}`}>
+
+                
+
+                {/* Top Bar */}
+
+                <div className="video-top-bar">
+
+                  <h3 className="video-title">{title || 'Tears of Steel'}</h3>
+
+                  {onClose && (
+
+                    <button onClick={handleClose} className="video-icon-btn">
+
+                      <X size={20} />
+
+                    </button>
+
+                  )}
+
+                </div>
+
+          {/* CENTER CONTROLS - Appears when controls are visible */}
+
+          {showControls && (
+
             <div className="video-center-play">
+
               <button onClick={togglePlay} className="video-play-button-large">
-                <Play size={40} fill="white" style={{ marginLeft: '4px' }} />
+
+                {isPlaying ? (
+
+                  <Pause size={40} fill="white" stroke="white" />
+
+                ) : (
+
+                  <Play size={40} fill="white" stroke="white" style={{ marginLeft: '4px' }} />
+
+                )}
+
               </button>
+
             </div>
+
           )}
 
-          {/* Bottom Bar */}
-          <div className="video-bottom-bar">
+          {/* Bottom Controls */}
+
+          <div className="video-bottom-bar" onClick={(e) => e.stopPropagation()}>
+
             
-            {/* Progress Bar */}
-            <div 
-              className="video-progress-bar"
-              onClick={(e) => {
-                if (videoRef.current) {
-                  const rect = e.currentTarget.getBoundingClientRect();
-                  const pos = (e.clientX - rect.left) / rect.width;
-                  videoRef.current.currentTime = pos * videoRef.current.duration;
-                }
-              }}
-            >
+
+            <div className="video-progress-container" onClick={handleSeek}>
+
               <div className="video-progress-fill" style={{ width: `${progress}%` }}>
+
                 <div className="video-progress-thumb"></div>
+
               </div>
+
             </div>
 
             <div className="video-controls-row">
-              
-              {/* Left Controls */}
+
               <div className="video-controls-left">
+
                 <button onClick={togglePlay} className="video-control-btn">
-                  {isPlaying ? <Pause size={24} fill="currentColor" /> : <Play size={24} fill="currentColor" />}
+
+                  {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" />}
+
                 </button>
+
                 
-                <div className="video-skip-buttons">
-                  <button onClick={() => skip(-10)} className="video-skip-btn">
-                    <RotateCcw size={20} />
-                  </button>
-                  <button onClick={() => skip(10)} className="video-skip-btn">
-                    <RotateCw size={20} />
-                  </button>
-                </div>
+
                 <div className="video-volume-control">
-                  <button onClick={toggleMute} className="video-control-btn">
+
+                  <button onClick={() => {
+
+                    const newMuted = !isMuted;
+
+                    setIsMuted(newMuted);
+
+                    videoRef.current.muted = newMuted;
+
+                  }} className="video-control-btn">
+
                     {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+
                   </button>
+
                   <div className="video-volume-slider-wrapper">
+
                     <input 
-                      type="range" min="0" max="1" step="0.1" 
+
+                      type="range" min="0" max="1" step="0.1" value={volume}
+
                       className="video-volume-slider"
+
                       onChange={(e) => {
-                        if (videoRef.current) {
-                          videoRef.current.volume = e.target.value;
-                        }
+
+                        const val = parseFloat(e.target.value);
+
+                        setVolume(val);
+
+                        videoRef.current.volume = val;
+
+                        setIsMuted(val === 0);
+
                       }}
+
                     />
+
                   </div>
+
                 </div>
-                <span className="video-time-display">
-                  {formatTime(currentTime)} / {formatTime(duration || 0)}
-                </span>
+
+                <span className="video-time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+
               </div>
 
-              {/* Right Controls */}
               <div className="video-controls-right">
-                
-                {/* Quality Selector */}
+
                 <div className="video-quality-container">
+
                   <button 
-                    onClick={() => setShowQualityMenu(!showQualityMenu)}
+
+                    onClick={(e) => { e.stopPropagation(); setShowQualityMenu(!showQualityMenu); }}
+
                     className="video-quality-btn"
+
                   >
-                    <Settings size={14} />
+
+                    <Settings size={14} style={{ marginRight: 6 }} />
+
                     {quality}
+
                   </button>
-                  
+
                   {showQualityMenu && (
+
                     <div className="video-quality-menu">
-                       <button 
-                         onClick={() => handleQualityChange(-1)}
-                         className={`video-quality-option ${quality === 'Auto' ? 'active' : ''}`}
-                       >
-                         Auto
-                       </button>
-                       {levels.map((level, idx) => (
-                         <button 
-                           key={idx}
-                           onClick={() => handleQualityChange(idx)}
-                           className={`video-quality-option ${quality === `${level.height}p` ? 'active' : ''}`}
-                         >
-                           {level.height}p
-                         </button>
-                       ))}
-                       {levels.length === 0 && (
-                         <div className="video-quality-empty">No levels found</div>
-                       )}
+
+                      <button 
+
+                        onClick={() => changeQuality(-1)} 
+
+                        className={`video-quality-option ${quality === 'Auto' ? 'active' : ''}`}
+
+                      >
+
+                        Auto
+
+                      </button>
+
+                      {getProcessedLevels().length > 0 ? (
+                        getProcessedLevels().map((level) => {
+                          const qualityLabel = formatQualityLabel(level.height);
+                          const isActive = quality === qualityLabel || 
+                            (quality.includes('Auto') === false && 
+                             levels[level.originalIndex] && 
+                             quality.includes(String(level.height)));
+
+                          return (
+                            <button 
+                              key={`${level.height}-${level.originalIndex}`} 
+                              onClick={() => changeQuality(level.originalIndex)} 
+                              className={`video-quality-option ${isActive ? 'active' : ''}`}
+                            >
+                              {qualityLabel}
+                            </button>
+                          );
+                        })
+                      ) : (
+                        // Fallback: show all levels if processing returns empty
+                        levels.map((level, idx) => {
+                          const qualityLabel = formatQualityLabel(level.height);
+                          const isActive = quality === qualityLabel || 
+                            (quality.includes('Auto') === false && 
+                             quality.includes(String(level.height)));
+
+                          return (
+                            <button 
+                              key={`${level.height}-${idx}`} 
+                              onClick={() => changeQuality(idx)} 
+                              className={`video-quality-option ${isActive ? 'active' : ''}`}
+                            >
+                              {qualityLabel}
+                            </button>
+                          );
+                        })
+                      )}
+
                     </div>
+
                   )}
+
                 </div>
+
                 <button onClick={toggleFullscreen} className="video-control-btn">
+
                   <Maximize size={20} />
+
                 </button>
+
               </div>
+
             </div>
+
           </div>
+
+        </div>
+
+      </div>
+
+    </div>
+
+      {/* Right Side - Chapters List */}
+      <div className="video-chapters-sidebar">
+        <div className="video-chapters-header">
+          <h4>Chapters</h4>
+        </div>
+        <div className="video-chapters-list">
+          {defaultChapters.map((chapter) => (
+            <button
+              key={chapter.id}
+              className="video-chapter-item"
+              onClick={() => {
+                // Parse time and seek to that position
+                const timeParts = chapter.time.split(':');
+                const minutes = parseInt(timeParts[0]) || 0;
+                const seconds = parseInt(timeParts[1]) || 0;
+                const timeInSeconds = minutes * 60 + seconds;
+                if (videoRef.current) {
+                  videoRef.current.currentTime = timeInSeconds;
+                  handleInteraction();
+                }
+              }}
+            >
+              <div className="video-chapter-number">{chapter.id}</div>
+              <div className="video-chapter-content">
+                <div className="video-chapter-title">{chapter.title}</div>
+                <div className="video-chapter-time">{chapter.time}</div>
+              </div>
+            </button>
+          ))}
         </div>
       </div>
+
+        </div>
+
+      </div>
+
     </div>
+
   );
+
 };
 
 export default VideoPlayer;

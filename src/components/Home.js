@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import './Home.css';
 import VideoLessonsPopup from './VideoLessonsPopup';
 import PopupCard, { RadioOption } from './PopupCard';
@@ -28,6 +28,11 @@ function Home() {
   const [showVideoLessons, setShowVideoLessons] = useState(false);
   const [selectedVideoOption, setSelectedVideoOption] = useState('');
   const [showVideoPlayer, setShowVideoPlayer] = useState(false);
+  
+  // Refs to manage video loading timeout and popup state
+  const videoLoadingTimeoutRef = useRef(null);
+  const isPopupOpenRef = useRef(false);
+  
   const [showVideoLessonsClassSelection, setShowVideoLessonsClassSelection] = useState(false);
   const [selectedVideoLessonsClass, setSelectedVideoLessonsClass] = useState('');
   const [showVideoLessonsSubjectSelection, setShowVideoLessonsSubjectSelection] = useState(false);
@@ -69,8 +74,8 @@ function Home() {
   const [hoveredPaperSubject, setHoveredPaperSubject] = useState(null);
   const [hoveredConcept, setHoveredConcept] = useState(null);
 
-  // Video URL - HLS format (using test stream like in the provided code)
-  const videoSource = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+  // Video URL - HLS format (tears-of-steel demo video)
+  const videoSource = "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8";
 
   // All existing handlers (keeping them all for popup functionality)
   const handleNavClick = (e, title) => {
@@ -141,6 +146,16 @@ function Home() {
   };
 
   const closeChapterSelection = () => {
+    // Mark popup as closed
+    isPopupOpenRef.current = false;
+    
+    // Clear any pending video loading timeout
+    if (videoLoadingTimeoutRef.current) {
+      clearTimeout(videoLoadingTimeoutRef.current);
+      videoLoadingTimeoutRef.current = null;
+    }
+    
+    // Reset all states
     setShowChapterSelection(false);
     setShowPdfVideoSelection(false);
     setShowSubjectSelection(false);
@@ -151,6 +166,9 @@ function Home() {
     setSelectedClass('');
     setIsLoadingChapter(false);
     setLoadingChapterType('');
+    
+    // Make sure video player doesn't open if it was loading
+    setShowVideoPlayer(false);
   };
 
   const handleChapterBack = () => {
@@ -177,6 +195,17 @@ function Home() {
 
   const handleChapterSelect = (chapter) => {
     setSelectedChapter(chapter);
+    // Reset the selected option when a new chapter is selected
+    setSelectedChapterOption('');
+    setIsLoadingChapter(false);
+    setLoadingChapterType('');
+    // Clear any pending video loading timeout
+    if (videoLoadingTimeoutRef.current) {
+      clearTimeout(videoLoadingTimeoutRef.current);
+      videoLoadingTimeoutRef.current = null;
+    }
+    // Reset popup ref
+    isPopupOpenRef.current = false;
   };
 
   const handleChapterContinue = (e) => {
@@ -185,6 +214,8 @@ function Home() {
     if (selectedChapter) {
       setShowChapterSelection(false);
       setShowPdfVideoSelection(true);
+      // Mark popup as open when showing PDF/Video selection
+      isPopupOpenRef.current = true;
     }
   };
 
@@ -210,18 +241,38 @@ function Home() {
   };
 
   const handleChapterOptionSelect = (option) => {
+    // Clear any existing timeout first
+    if (videoLoadingTimeoutRef.current) {
+      clearTimeout(videoLoadingTimeoutRef.current);
+      videoLoadingTimeoutRef.current = null;
+    }
+    
     setSelectedChapterOption(option);
     if (option === 'pdf') {
       downloadEShalaPDF();
       setIsLoadingChapter(false);
       setShowPdfVideoSelection(false);
     } else if (option === 'video') {
-    setIsLoadingChapter(true);
-    setLoadingChapterType(option);
-    setTimeout(() => {
-      setIsLoadingChapter(false);
-        setShowPdfVideoSelection(false);
-        setShowVideoPlayer(true);
+      // Mark popup as open
+      isPopupOpenRef.current = true;
+      setIsLoadingChapter(true);
+      setLoadingChapterType(option);
+      // Store timeout reference so it can be cleared if user closes popup
+      videoLoadingTimeoutRef.current = setTimeout(() => {
+        console.log('⏰ Video loading timeout completed');
+        console.log('⏰ isPopupOpenRef.current:', isPopupOpenRef.current);
+        console.log('⏰ videoLoadingTimeoutRef.current:', videoLoadingTimeoutRef.current);
+        // Only open video player if popup is still open (not closed)
+        if (isPopupOpenRef.current && videoLoadingTimeoutRef.current) {
+          console.log('✅ Opening video player from timeout');
+          setIsLoadingChapter(false);
+          setShowPdfVideoSelection(false);
+          setShowVideoPlayer(true);
+          console.log('✅ showVideoPlayer set to true');
+        } else {
+          console.log('❌ Not opening video player - popup was closed or timeout cleared');
+        }
+        videoLoadingTimeoutRef.current = null;
       }, 2000);
     }
   };
@@ -484,8 +535,58 @@ function Home() {
   };
 
   const closeVideoPlayer = () => {
+    console.log('🔴 closeVideoPlayer called');
+    // Clear any pending video loading timeout
+    if (videoLoadingTimeoutRef.current) {
+      clearTimeout(videoLoadingTimeoutRef.current);
+      videoLoadingTimeoutRef.current = null;
+    }
     setShowVideoPlayer(false);
+    console.log('🔴 showVideoPlayer set to false');
   };
+
+  // Go back to format selection from video player
+  const goBackToFormatSelection = () => {
+    console.log('🔙 goBackToFormatSelection called');
+    // Clear any pending video loading timeout
+    if (videoLoadingTimeoutRef.current) {
+      clearTimeout(videoLoadingTimeoutRef.current);
+      videoLoadingTimeoutRef.current = null;
+    }
+    // Close video player completely
+    setShowVideoPlayer(false);
+    // Reset ALL state related to video selection
+    setSelectedChapterOption('');
+    setIsLoadingChapter(false);
+    setLoadingChapterType('');
+    // Reset the popup open ref so video can be opened again
+    isPopupOpenRef.current = false;
+    // Show the format selection popup again
+    setShowPdfVideoSelection(true);
+    console.log('🔙 Back to format selection - all state reset, showPdfVideoSelection set to true');
+  };
+
+  // Generate chapters list based on selected chapter
+  const getChapters = () => {
+    const allChapters = [
+      { id: 1, title: 'Introduction', time: '0:00' },
+      { id: 2, title: 'Chapter 1: Basics', time: '5:30' },
+      { id: 3, title: 'Chapter 2: Advanced Concepts', time: '12:45' },
+      { id: 4, title: 'Chapter 3: Practice Problems', time: '20:10' },
+      { id: 5, title: 'Summary and Review', time: '28:00' },
+    ];
+    return allChapters;
+  };
+  
+  // Cleanup timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (videoLoadingTimeoutRef.current) {
+        clearTimeout(videoLoadingTimeoutRef.current);
+        videoLoadingTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // Helper function to get the correct video title based on the flow
   const getVideoTitle = () => {
@@ -1581,7 +1682,11 @@ function Home() {
 
               {/* Card 2: Video Lessons */}
               <div 
-                onClick={() => setShowVideoPlayer(true)}
+                onClick={() => {
+                  console.log('🟢 Video card clicked - setting showVideoPlayer to true');
+                  setShowVideoPlayer(true);
+                  console.log('🟢 showVideoPlayer should now be true');
+                }}
                 className="home-feature-card home-card-video"
               >
                 <div className="home-card-badge-pulse"></div>
@@ -1809,11 +1914,16 @@ function Home() {
         </div>
 
       {/* Video Player */}
-      {showVideoPlayer && (
+      {(() => {
+        console.log('🔍 Checking showVideoPlayer state:', showVideoPlayer);
+        return showVideoPlayer;
+      })() && (
         <VideoPlayer
           src={videoSource}
           title={getVideoTitle()}
           onClose={closeVideoPlayer}
+          onBack={goBackToFormatSelection}
+          chapters={getChapters()}
         />
       )}
     </div>
